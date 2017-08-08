@@ -1066,12 +1066,19 @@ let restore_vgpu (task: Xenops_task.t) ~xc ~xs domid fd vgpu vcpus =
 
 type suspend_flag = Live | Debug
 
-let write_libxc_record ~(task: Xenops_task.t) ~xc ~xs ~hvm ~xenguest_path ~domid
-	~uuid ~fd ~vgpu_fd ~flags ~progress_callback ~qemu_domid ~do_suspend_callback =
+let suspend_emu_manager ~(task: Xenops_task.t) ~xc ~xs ~hvm ~xenguest_path ~domid
+	~uuid ~fd ~vgpu_fd ~flags ~progress_callback ~qemu_domid ~do_suspend_callback
+	~legacy_libxc =
+	let open Suspend_image in let open Suspend_image.M in
+	let open XenguestHelper in
+
 	let fd_uuid = Uuid.(to_string (create `V4)) in
 
 	let vgpu_args, vgpu_cmdline =
 		match vgpu_fd with
+		| Some fd when fd = main_fd ->
+			[fd_uuid, main_fd],
+			["-dm"; "vgpu:" ^ fd_uuid]
 		| Some fd ->
 			let vgpu_fd_uuid = Uuid.(to_string (create `V4)) in
 			[vgpu_fd_uuid, fd],
@@ -1095,17 +1102,15 @@ let write_libxc_record ~(task: Xenops_task.t) ~xc ~xs ~hvm ~xenguest_path ~domid
 
 	let fds = [fd_uuid, fd] @ vgpu_args in
 
-	XenguestHelper.with_connection task xenguest_path domid xenguestargs fds
-		(fun cnx ->
-		debug "VM = %s; domid = %d; waiting for xenguest to call suspend callback" (Uuid.to_string uuid) domid;
-
-		(* Monitor the debug (stderr) output of the xenguest helper and
+	(* Start the emu-manager process and connect to the control socket *)
+	with_connection task xenguest_path domid xenguestargs fds (fun cnx ->
+		(* Callback to monitor the debug (stderr) output of the process and
 		   spot the progress indicator *)
 		let callback txt =
 			let prefix = "\\b\\b\\b\\b" in
 			if String.startswith prefix txt then
 				let rest = String.sub txt (String.length prefix)
-				                   (String.length txt - (String.length prefix)) in
+					(String.length txt - (String.length prefix)) in
 				match Stdext.Xstringext.String.split_f (fun c -> c = ' ' || c = '%') rest with
 				| [ percent ] -> (
 					try
@@ -1114,44 +1119,58 @@ let write_libxc_record ~(task: Xenops_task.t) ~xc ~xs ~hvm ~xenguest_path ~domid
 						progress_callback (float_of_int percent /. 100.)
 					with e ->
 						error "VM = %s; domid = %d; failed to parse progress update: \"%s\"" (Uuid.to_string uuid) domid percent;
-                        (* MTC: catch exception by progress_callback, for example,
-                           an abort request, and re-raise them *)
-                        raise e
+						(* MTC: catch exception by progress_callback, for example,
+						   an abort request, and re-raise them *)
+						raise e
 					)
 				| _ -> ()
 			else
 				debug "VM = %s; domid = %d; %s" (Uuid.to_string uuid) domid txt
 			in
 
-		(match XenguestHelper.non_debug_receive ~debug_callback:callback cnx with
-			| XenguestHelper.Suspend ->
-				debug "VM = %s; domid = %d; suspend callback called" (Uuid.to_string uuid) domid;
-			| XenguestHelper.Error x ->
-				error "VM = %s; domid = %d; xenguesthelper failed: \"%s\"" (Uuid.to_string uuid) domid x;
-				raise (Xenguest_failure (Printf.sprintf "Error while waiting for suspend notification: %s" x))
-			| msg ->
-				let err = Printf.sprintf "expected %s got %s"
-					(XenguestHelper.string_of_message XenguestHelper.Suspend)
-					(XenguestHelper.string_of_message msg) in
-				error "VM = %s; domid = %d; xenguesthelper protocol failure %s" (Uuid.to_string uuid) domid err;
-				raise (Xenguest_protocol_failure err));
-		do_suspend_callback ();
-		if hvm then (
-			debug "VM = %s; domid = %d; suspending qemu-dm" (Uuid.to_string uuid) domid;
-			Device.Dm.suspend task ~xs ~qemu_domid domid;
-		);
- 		XenguestHelper.send cnx "done\n";
-
-		let msg = XenguestHelper.non_debug_receive cnx in
-		progress_callback 1.;
-		match msg with
-		| XenguestHelper.Result x ->
-			debug "VM = %s; domid = %d; xenguesthelper returned \"%s\"" (Uuid.to_string uuid) domid x
-		| XenguestHelper.Error x  ->
-			error "VM = %s; domid = %d; xenguesthelper failed: \"%s\"" (Uuid.to_string uuid) domid x;
-		    raise (Xenguest_failure (Printf.sprintf "Received error from xenguesthelper: %s" x))
-		| _                       ->
-			error "VM = %s; domid = %d; xenguesthelper protocol failure" (Uuid.to_string uuid) domid;
+		(* Process started; wait for and respond to instructions *)
+		let rec wait_for_message () =
+			debug "VM = %s; domid = %d; waiting for emu-manager..." (Uuid.to_string uuid) domid;
+			let message = non_debug_receive ~debug_callback:callback cnx in
+			debug "VM = %s; domid = %d; message from emu-manager: %s"
+				(Uuid.to_string uuid) domid (string_of_message message);
+			match message with
+			| Suspend ->
+				do_suspend_callback ();
+				if hvm then (
+					debug "VM = %s; domid = %d; suspending qemu-dm" (Uuid.to_string uuid) domid;
+					Device.Dm.suspend task ~xs ~qemu_domid domid;
+				);
+				send_done cnx;
+				wait_for_message ()
+			| Prepare x when x = "xenguest" ->
+				debug "Writing Libxc%s header" (if legacy_libxc then "_legacy" else "");
+				let libxc_header = (if legacy_libxc then Libxc_legacy else Libxc) in
+				write_header fd (libxc_header, 0L) >>= fun () ->
+				debug "Writing Libxc record";
+				send_done cnx;
+				wait_for_message ()
+			| Prepare x when x = "vgpu" ->
+				(match vgpu_fd with
+				| Some fd ->
+					debug "Writing DEMU header";
+					write_header fd (Demu, 0L) >>= fun () ->
+					debug "Writing DEMU record";
+					send_done cnx;
+					wait_for_message ()
+				| None ->
+					`Error (Xenguest_failure ("Received prepare:vgpu from emu-manager, but there is no vGPU fd")))
+			| Result x ->
+				debug "VM = %s; domid = %d; emu-manager completed successfully" (Uuid.to_string uuid) domid;
+				return ()
+			| Error x ->
+				error "VM = %s; domid = %d; emu-manager failed: \"%s\"" (Uuid.to_string uuid) domid x;
+				`Error (Xenguest_failure (Printf.sprintf "Received error from emu-manager: %s" x))
+			| _ ->
+				error "VM = %s; domid = %d; unexpected message from emu-manager" (Uuid.to_string uuid) domid;
+				`Error (Xenguest_failure ("xenguesthelper protocol failure"))
+		in
+		wait_for_message ()
 	)
 
 let write_qemu_record domid uuid legacy_libxc fd =
@@ -1203,14 +1222,9 @@ let suspend (task: Xenops_task.t) ~xc ~xs ~hvm xenguest_path vm_str domid fd vgp
 		write_header fd (Xenops, Int64.of_int xenops_rec_len) >>= fun () ->
 		debug "Writing Xenops record contents";
 		Io.write fd xenops_record;
-		(* Libxc record *)
 		let legacy_libxc = not (XenguestHelper.supports_feature xenguest_path "migration-v2") in
-		debug "Writing Libxc%s header" (if legacy_libxc then "_legacy" else "");
-		let libxc_header = (if legacy_libxc then Libxc_legacy else Libxc) in
-		write_header fd (libxc_header, 0L) >>= fun () ->
-		debug "Writing Libxc record";
-		write_libxc_record ~task ~xc ~xs ~hvm ~xenguest_path ~domid ~uuid ~fd ~vgpu_fd ~flags
-			~progress_callback ~qemu_domid ~do_suspend_callback;
+		suspend_emu_manager ~task ~xc ~xs ~hvm ~xenguest_path ~domid ~uuid ~fd ~vgpu_fd ~flags
+			~progress_callback ~qemu_domid ~do_suspend_callback ~legacy_libxc >>= fun () ->
 		(* Qemu record (if this is a hvm domain) *)
 		(* Currently Qemu suspended inside above call with the libxc memory
 		* image, we should try putting it below in the relevant section of the
@@ -1218,6 +1232,7 @@ let suspend (task: Xenops_task.t) ~xc ~xs ~hvm xenguest_path vm_str domid fd vgp
 		(if hvm then write_qemu_record domid uuid legacy_libxc fd else return ()) >>= fun () ->
 		debug "Qemu record written";
 		debug "Writing End_of_image footer";
+		progress_callback 1.;
 		write_header fd (End_of_image, 0L)
 	in match res with
 	| `Ok () ->
