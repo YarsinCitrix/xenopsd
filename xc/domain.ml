@@ -814,6 +814,7 @@ let with_emu_manager_restore (task: Xenops_task.t) ~hvm ~store_port ~console_por
 	XenguestHelper.with_connection task xenguest_path domid args fds f
 
 let restore_libxc_record cnx domid uuid =
+	XenguestHelper.send_restore cnx "xenguest";
 	let line = XenguestHelper.receive_success cnx in
 	match Stdext.Xstringext.String.split ' ' line with
 	| [ store; console ] ->
