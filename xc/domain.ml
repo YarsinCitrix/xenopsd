@@ -799,9 +799,20 @@ let build (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid ~timeoffset 
 		            ~kernel:info.kernel ~cmdline:pvinfo.cmdline ~ramdisk:pvinfo.ramdisk
 		            ~vcpus:info.vcpus ~extras xenguest_path domid force
 
-let with_emu_manager_restore (task: Xenops_task.t) ~hvm ~store_port ~console_port ~extras xenguest_path domid uuid fd f =
+let with_emu_manager_restore (task: Xenops_task.t) ~hvm ~store_port ~console_port ~extras xenguest_path domid uuid main_fd vgpu_fd f =
 	let fd_uuid = Uuid.(to_string (create `V4)) in
-	let fds = [ fd_uuid, fd ] in
+	let vgpu_args, vgpu_cmdline =
+		match vgpu_fd with
+		| Some fd when fd = main_fd ->
+			[fd_uuid, main_fd],
+			["-dm"; "vgpu:" ^ fd_uuid]
+		| Some fd ->
+			let vgpu_fd_uuid = Uuid.(to_string (create `V4)) in
+			[vgpu_fd_uuid, fd],
+			["-dm"; "vgpu:" ^ vgpu_fd_uuid]
+		| None -> [], []
+	in
+	let fds = [ fd_uuid, main_fd ] @ vgpu_args in
 	let args = [
 			"-mode"; if hvm then "hvm_restore" else "restore";
 			"-domid"; string_of_int domid;
@@ -809,7 +820,7 @@ let with_emu_manager_restore (task: Xenops_task.t) ~hvm ~store_port ~console_por
 			"-store_port"; string_of_int store_port;
 			"-console_port"; string_of_int console_port;
 			"-fork"; "true";
-		] @ extras
+		] @ extras @ vgpu_cmdline
 	in
 	XenguestHelper.with_connection task xenguest_path domid args fds f
 
@@ -871,7 +882,7 @@ let restore_common (task: Xenops_task.t) ~xc ~xs ~hvm ~store_port ~store_domid
 		let (store_mfn, console_mfn) =
 			begin match
 				with_conversion_script task "XenguestHelper" hvm fd (fun pipe_r ->
-					with_emu_manager_restore task ~hvm ~store_port ~console_port ~extras xenguest_path domid uuid fd (fun cnx ->
+					with_emu_manager_restore task ~hvm ~store_port ~console_port ~extras xenguest_path domid uuid fd vgpu_fd (fun cnx ->
 						restore_libxc_record cnx domid uuid
 					)
 				)
@@ -900,7 +911,7 @@ let restore_common (task: Xenops_task.t) ~xc ~xs ~hvm ~store_port ~store_domid
 		store_mfn, console_mfn
 	| `Ok Structured ->
 		let open Suspend_image.M in
-		with_emu_manager_restore task ~hvm ~store_port ~console_port ~extras xenguest_path domid uuid fd (fun cnx ->
+		with_emu_manager_restore task ~hvm ~store_port ~console_port ~extras xenguest_path domid uuid fd vgpu_fd (fun cnx ->
 			let rec process_header res =
 				debug "Reading next header...";
 				read_header fd >>= function
