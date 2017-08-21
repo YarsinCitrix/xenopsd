@@ -857,7 +857,10 @@ let consume_qemu_record fd limit domid uuid =
 		end
 	) (fun () -> Unix.close fd2)
 
-let restore_common (task: Xenops_task.t) ~xc ~xs ~hvm ~store_port ~store_domid ~console_port ~console_domid ~no_incr_generationid ~vcpus ~extras xenguest_path domid fd =
+let restore_common (task: Xenops_task.t) ~xc ~xs ~hvm ~store_port ~store_domid
+	~console_port ~console_domid ~no_incr_generationid ~vcpus ~extras
+	xenguest_path domid fd vgpu_fd =
+
 	let module DD = Debug.Make(struct let name = "mig64" end) in
 	let open DD in
 	let uuid = get_uuid ~xc domid in
@@ -946,7 +949,9 @@ let resume (task: Xenops_task.t) ~xc ~xs ~hvm ~cooperative ~qemu_domid domid =
 	resume_post ~xc	~xs domid;
 	if hvm then Device.Dm.resume task ~xs ~qemu_domid domid
 
-let pv_restore (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid ~no_incr_generationid ~static_max_kib ~target_kib ~vcpus ~extras xenguest_path domid fd =
+let pv_restore (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid
+	~no_incr_generationid ~static_max_kib ~target_kib ~vcpus ~extras
+	xenguest_path domid fd vgpu_fd =
 
 	(* Convert memory configuration values into the correct units. *)
 	let static_max_mib = Memory.mib_of_kib_used static_max_kib in
@@ -972,7 +977,7 @@ let pv_restore (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid ~no_inc
 		~store_port ~store_domid
 		~console_port ~console_domid
 		~no_incr_generationid
-		~vcpus ~extras xenguest_path domid fd in
+		~vcpus ~extras xenguest_path domid fd vgpu_fd in
 
 	let local_stuff = [
 		"serial/0/limit",    string_of_int 65536;
@@ -983,7 +988,9 @@ let pv_restore (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid ~no_inc
 	build_post ~xc ~xs ~vcpus ~target_mib ~static_max_mib
 		domid store_mfn store_port local_stuff vm_stuff
 
-let hvm_restore (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid ~no_incr_generationid ~static_max_kib ~target_kib ~shadow_multiplier ~vcpus ~timeoffset ~extras xenguest_path domid fd =
+let hvm_restore (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid
+	~no_incr_generationid ~static_max_kib ~target_kib ~shadow_multiplier ~vcpus
+	~timeoffset ~extras xenguest_path domid fd vgpu_fd =
 
 	(* Convert memory configuration values into the correct units. *)
 	let static_max_mib = Memory.mib_of_kib_used static_max_kib in
@@ -1008,7 +1015,7 @@ let hvm_restore (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid ~no_in
 		~store_port ~store_domid
 		~console_port ~console_domid
 		~no_incr_generationid
-		~vcpus ~extras xenguest_path domid fd in
+		~vcpus ~extras xenguest_path domid fd vgpu_fd in
 	let local_stuff = [
 		"serial/0/limit",    string_of_int 65536;
 		"console/port",     string_of_int console_port;
@@ -1021,7 +1028,8 @@ let hvm_restore (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid ~no_in
 	build_post ~xc ~xs ~vcpus ~target_mib ~static_max_mib
 		domid store_mfn store_port local_stuff vm_stuff
 
-let restore (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid ~no_incr_generationid ~timeoffset ~extras info xenguest_path domid fd =
+let restore (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid
+	~no_incr_generationid ~timeoffset ~extras info xenguest_path domid fd vgpu_fd =
 	let restore_fct = match info.priv with
 	| BuildHVM hvminfo ->
 		hvm_restore task ~shadow_multiplier:hvminfo.shadow_multiplier
@@ -1031,7 +1039,7 @@ let restore (task: Xenops_task.t) ~xc ~xs ~store_domid ~console_domid ~no_incr_g
 		in
 	restore_fct ~xc ~xs ~store_domid ~console_domid ~no_incr_generationid
 	            ~static_max_kib:info.memory_max ~target_kib:info.memory_target ~vcpus:info.vcpus ~extras
-	            xenguest_path domid fd
+	            xenguest_path domid fd vgpu_fd
 
 let restore_vgpu (task: Xenops_task.t) ~xc ~xs domid fd vgpu vcpus =
 	let uuid = get_uuid ~xc domid in
