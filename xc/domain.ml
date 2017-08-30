@@ -927,7 +927,7 @@ let restore_common (task: Xenops_task.t) ~xc ~xs ~hvm ~store_port ~store_domid
 					debug "Read Xenops record header (length=%Ld)" len;
 					let rec_str = Io.read fd (Io.int_of_int64_exn len) in
 					debug "Read Xenops record contents";
-					let (_ : Xenops_record.t) = Xenops_record.of_string rec_str in
+					Xenops_record.of_string rec_str >>= fun (_ : Xenops_record.t) ->
 					debug "Validated Xenops record contents";
 					process_header fd res
 				| Libxc, _ ->
@@ -1215,10 +1215,10 @@ let suspend (task: Xenops_task.t) ~xc ~xs ~hvm xenguest_path vm_str domid main_f
 	 * short-term fix, we sent nothing but keep the write to maintain the
 	 * protocol.
 	 *)
-	let xs_subtree = [] in
-	let xenops_record = Xenops_record.(to_string (make ~xs_subtree ~vm_str ())) in
-	let xenops_rec_len = String.length xenops_record in
 	let res =
+		let xs_subtree = [] in
+		Xenops_record.(to_string (make ~xs_subtree ~vm_str ())) >>= fun xenops_record ->
+		let xenops_rec_len = String.length xenops_record in
 		debug "Writing Xenops header (length=%d)" xenops_rec_len;
 		write_header main_fd (Xenops, Int64.of_int xenops_rec_len) >>= fun () ->
 		debug "Writing Xenops record contents";
